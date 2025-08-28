@@ -52,6 +52,8 @@ error_window = []
 error_window_size = 10
 error_threshold = 5
 monitoring = 0
+in_monitor_time_count = 0
+out_monitor_time_count = 0
 running_list = []
 url_tuples_list = []
 url_comments = []
@@ -87,6 +89,30 @@ def signal_handler(_signal, _frame):
 signal.signal(signal.SIGTERM, signal_handler)
 
 
+def check_time_schedule_changes() -> None:
+    """定时检查时间段变化并调整监控状态"""
+    global text_no_repeat_url, in_monitor_time_count, out_monitor_time_count, running_list, monitoring
+    
+    while True:
+        time.sleep(60)  # 每分钟检查一次
+        try:
+            # 重新检查所有URL的时间段状态
+            for url_config in text_no_repeat_url:
+                url_config.update_monitor_status()
+            
+            # 更新统计
+            in_monitor_time_count = 0
+            out_monitor_time_count = 0
+            for url_config in text_no_repeat_url:
+                if url_config.in_monitor_time:
+                    in_monitor_time_count += 1
+                else:
+                    out_monitor_time_count += 1
+                    
+        except Exception as e:
+            logger.error(f"检查时间段变化时出错: {e}")
+
+
 def display_info() -> None:
     global start_display_time
     time.sleep(5)
@@ -97,6 +123,8 @@ def display_info() -> None:
             if Path(sys.executable).name != 'pythonw.exe':
                 os.system(clear_command)
             print(f"\r共监测{monitoring}个直播中", end=" | ")
+            if in_monitor_time_count + out_monitor_time_count > 0:
+                print(f"在监控时段内：{in_monitor_time_count}个，不在监控时段：{out_monitor_time_count}个", end=" | ")
             print(f"同一时间访问网络的线程数: {max_request}", end=" | ")
             print(f"是否开启代理录制: {'是' if use_proxy else '否'}", end=" | ")
             if split_video_by_time:
@@ -487,7 +515,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
             new_record_url = ''
             count_time = time.time()
             retry = 0
-            record_quality_zh, record_url, anchor_name = url_data
+            record_quality_zh, record_url, anchor_name, time_schedule, in_monitor_time = url_data
             record_quality = get_quality_code(record_quality_zh)
             proxy_address = proxy_addr
             platform = '未知平台'
@@ -994,7 +1022,8 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                             clear_record_info(record_name, record_url)
                             return
 
-                        if not url_data[-1] and run_once is False:
+                        # 检查是否不在监控时段内
+                        if not in_monitor_time and run_once is False:
                             if new_record_url:
                                 need_update_line_list.append(
                                     f'{record_url}|{new_record_url},主播: {anchor_name.strip()}')
@@ -1820,6 +1849,133 @@ while True:
         return re.search(pattern, string) is not None
 
 
+    from pydantic import BaseModel, Field, field_validator
+    from typing import Tuple
+    
+    class URLConfig(BaseModel):
+        """URL配置数据模型"""
+        quality: str = Field(default="原画", description="录制质量")
+        url: str = Field(..., description="直播间URL") 
+        name: str = Field(default="", description="主播名")
+        time_schedule: str = Field(default="", description="监控时段配置")
+        in_monitor_time: bool = Field(default=True, description="当前是否在监控时段内")
+        
+        @field_validator('quality')
+        @classmethod
+        def validate_quality(cls, v):
+            valid_qualities = ("原画", "蓝光", "超清", "高清", "标清", "流畅")
+            if v not in valid_qualities:
+                return "原画"
+            return v
+        
+        @field_validator('url')
+        @classmethod
+        def validate_url(cls, v):
+            if not v:
+                raise ValueError("URL不能为空")
+            if '://' not in v:
+                v = 'https://' + v
+            return v
+        
+        def update_monitor_status(self) -> None:
+            """更新监控时段状态"""
+            if self.time_schedule:
+                schedules = parse_time_schedule(self.time_schedule)
+                self.in_monitor_time = is_in_monitor_time(schedules)
+            else:
+                self.in_monitor_time = True
+        
+        def to_tuple(self) -> Tuple:
+            """转换为元组格式，兼容start_record函数"""
+            return (self.quality, self.url, self.name, self.time_schedule, self.in_monitor_time)
+        
+        def __hash__(self) -> int:
+            """基于URL生成哈希值，用于set去重"""
+            return hash(self.url)
+        
+        def __eq__(self, other) -> bool:
+            """基于URL判断相等性"""
+            if isinstance(other, URLConfig):
+                return self.url == other.url
+            return False
+    
+    def create_url_config(quality: str, url: str, name: str, time_schedule: str = "") -> URLConfig:
+        """创建URL配置对象的工厂函数"""
+        config = URLConfig(
+            quality=quality,
+            url=url, 
+            name=name,
+            time_schedule=time_schedule
+        )
+        config.update_monitor_status()
+        return config
+
+
+    def parse_time_schedule(schedule_str: str) -> list:
+        """
+        解析时间段配置字符串
+        格式: 星期:开始时间-结束时间;星期:开始时间-结束时间
+        例如: 1-5:09:00-18:00;6-7:20:00-23:59
+        返回: [{'weekdays': [1,2,3,4,5], 'start': '09:00', 'end': '18:00'}, ...]
+        """
+        if not schedule_str:
+            return []
+        
+        schedules = []
+        for period in schedule_str.split(';'):
+            if ':' not in period:
+                continue
+            
+            weekday_part, time_part = period.split(':', 1)
+            if '-' not in time_part:
+                continue
+                
+            start_time, end_time = time_part.split('-', 1)
+            
+            # 解析星期范围
+            weekdays = []
+            if '-' in weekday_part:
+                start_day, end_day = map(int, weekday_part.split('-'))
+                weekdays = list(range(start_day, end_day + 1))
+            else:
+                weekdays = [int(weekday_part)]
+            
+            schedules.append({
+                'weekdays': weekdays,
+                'start': start_time,
+                'end': end_time
+            })
+        
+        return schedules
+
+
+    def is_in_monitor_time(schedules: list) -> bool:
+        """
+        判断当前时间是否在监控时段内
+        """
+        if not schedules:
+            return True  # 没有配置时间段则默认24小时监控
+        
+        now = datetime.datetime.now()
+        current_weekday = now.isoweekday()  # 1=周一, 7=周日
+        current_time = now.strftime("%H:%M")
+        
+        for schedule in schedules:
+            if current_weekday in schedule['weekdays']:
+                start_time = schedule['start']
+                end_time = schedule['end']
+                
+                # 处理跨天的时间段
+                if start_time <= end_time:
+                    if start_time <= current_time <= end_time:
+                        return True
+                else:
+                    if current_time >= start_time or current_time <= end_time:
+                        return True
+        
+        return False
+
+
     try:
         url_comments, line_list, url_line_list = [[] for _ in range(3)]
         with (open(url_config_file, "r", encoding=text_encoding, errors='ignore') as file):
@@ -1844,6 +2000,17 @@ while True:
                 else:
                     split_line = [line, '']
 
+                # 解析时间段配置
+                time_schedule = ""
+                for i, part in enumerate(split_line):
+                    if '监控时段:' in part:
+                        time_schedule = part.split('监控时段:')[1].strip()
+                        split_line[i] = part.split('监控时段:')[0].strip()
+                        break
+
+                # 过滤掉空的部分
+                split_line = [part.strip() for part in split_line if part.strip()]
+
                 if len(split_line) == 1:
                     url = split_line[0]
                     quality, name = [video_record_quality, '']
@@ -1855,7 +2022,7 @@ while True:
                         quality, url = split_line
                         name = ''
                 else:
-                    quality, url, name = split_line
+                    quality, url, name = split_line[:3]
 
                 if quality not in ("原画", "蓝光", "超清", "高清", "标清", "流畅"):
                     quality = '原画'
@@ -1976,8 +2143,9 @@ while True:
                     if is_comment_line:
                         url_comments.append(url)
                     else:
-                        new_line = (quality, url, name)
-                        url_tuples_list.append(new_line)
+                        # 使用URLConfig模型创建配置对象
+                        url_config = create_url_config(quality, url, name, time_schedule)
+                        url_tuples_list.append(url_config)
                 else:
                     if not origin_line.startswith('#'):
                         color_obj.print_colored(f"\r{origin_line.strip()} 本行包含未知链接.此条跳过", color_obj.YELLOW)
@@ -1996,22 +2164,35 @@ while True:
                 update_file(url_config_file, old_str=replace_words[0], new_str=new_word, start_str=start_with)
 
         text_no_repeat_url = list(set(url_tuples_list))
+        
+        # 统计在监控时段内和不在监控时段内的URL数量
+        in_monitor_time_count = 0
+        out_monitor_time_count = 0
+        for item in text_no_repeat_url:
+            if item.in_monitor_time:
+                in_monitor_time_count += 1
+            else:
+                out_monitor_time_count += 1
 
         if len(text_no_repeat_url) > 0:
-            for url_tuple in text_no_repeat_url:
+            for url_config in text_no_repeat_url:
                 monitoring = len(running_list)
 
-                if url_tuple[1] in not_record_list:
+                if url_config.url in not_record_list:
                     continue
 
-                if url_tuple[1] not in running_list:
-                    print(f"\r{'新增' if not first_start else '传入'}地址: {url_tuple[1]}")
+                # 检查是否在监控时段内
+                if not url_config.in_monitor_time:
+                    continue
+
+                if url_config.url not in running_list:
+                    print(f"\r{'新增' if not first_start else '传入'}地址: {url_config.url}")
                     monitoring += 1
-                    args = [url_tuple, monitoring]
+                    args = [url_config.to_tuple(), monitoring]
                     create_var[f'thread_{monitoring}'] = threading.Thread(target=start_record, args=args)
                     create_var[f'thread_{monitoring}'].daemon = True
                     create_var[f'thread_{monitoring}'].start()
-                    running_list.append(url_tuple[1])
+                    running_list.append(url_config.url)
                     time.sleep(local_delay_default)
         url_tuples_list = []
         first_start = False
@@ -2024,6 +2205,8 @@ while True:
         t.start()
         t2 = threading.Thread(target=adjust_max_request, args=(), daemon=True)
         t2.start()
+        t4 = threading.Thread(target=check_time_schedule_changes, args=(), daemon=True)
+        t4.start()
         first_run = False
 
     time.sleep(3)

@@ -166,3 +166,4 @@ cython_debug/
 
 backup_config/
 ffmpeg
+config/config.ini
