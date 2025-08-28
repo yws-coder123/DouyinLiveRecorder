@@ -20,7 +20,7 @@ from src.logger import logger
 current_platform = platform.system()
 execute_dir = os.path.split(os.path.realpath(sys.argv[0]))[0]
 current_env_path = os.environ.get('PATH')
-ffmpeg_path = os.path.join(execute_dir, 'ffmpeg')
+ffmpeg_path = os.path.join(execute_dir, 'ffmpeg/bin')
 
 
 def unzip_file(zip_path: str | Path, extract_to: str | Path, delete: bool = True) -> None:
